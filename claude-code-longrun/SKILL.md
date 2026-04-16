@@ -19,188 +19,175 @@ Use this skill when **Claude Code** is the requested tool and the task is too la
 
 - The task is tiny and can finish in one `claude --print` call.
 - The user asked for Codex, Pi, ACP harness, or another tool.
-- The work is a simple local edit you can do directly.
 - The work must happen in a Discord thread via ACP harness. In that case use `sessions_spawn` with `runtime:"acp"`.
 
-## Core rule
+---
 
-For **Claude Code long tasks**, prefer:
+# TWO-AGENT ARCHITECTURE
 
-1. **tmux session** for persistence
-2. **task file** for long instructions
-3. **low-frequency monitoring** instead of frequent interruption
+| Agent | Role |
+|-------|------|
+| **Parent agent** (you) | Pre-create tmux session, write task file, spawn operator sub-agent |
+| **Operator sub-agent** | Send task to Claude Code via tmux, monitor progress, collect results |
 
-Avoid treating Claude Code like a fire-and-forget one-shot when the user actually wants a continuing working session.
+**CRITICAL**: The operator sub-agent does NOT create tmux sessions. The parent creates the tmux session BEFORE spawning the sub-agent.
 
-## Why
+---
 
-`claude --print` is fine for short tasks, but it is not the best default when:
+# Phase 1: Parent Agent Workflow
 
-- you want to preserve context across multiple turns,
-- the prompt is long,
-- the task may branch into investigation, edits, tests, and fixes,
-- or the user will probably say “继续”, “再改一下”, “顺手把这个也做了”.
-
-The failure mode is usually **over-interrupting too early**, not Claude Code being unable to handle the work.
-
-## Preferred workflow
-
-### 1. Start a dedicated tmux session
-
-Use a clear session name related to the task.
-
-Example:
+### Step 1: Create tmux session
 
 ```bash
-tmux new-session -d -s claude-auth-fix
+SESSION_NAME="claude-$(date +%s)"
+tmux new-session -d -s "$SESSION_NAME"
 ```
 
-If the project directory matters, start Claude from the correct working directory.
+Save `$SESSION_NAME` — you'll pass it to the sub-agent.
 
-### 2. Write a task file
+### Step 2: Write the task file
 
-Do not stuff a long brief directly into shell quoting if you can avoid it.
+```javascript
+write({
+  path: "/root/.openclaw/workspace/scripts/task-[shortname].md",
+  content: `## Goal
+[One sentence describing the end result]
 
-Create a task file inside the target project or a temp path, for example:
+## Project Context
+- repo or directory: [path]
+- relevant files: [list]
 
-- `./.openclaw-tasks/claude-task.md`
-- `/tmp/claude-task-<slug>.md`
+## Constraints
+- [any limitations]
 
-The task file should include:
+## What to do
+1. [concrete steps]
 
-- the user goal
-- scope boundaries
-- constraints
-- repo/path context
-- required checks or tests
-- expected final output format
+## Deliverable
+[Summarize what to report back]`
+});
+```
 
-Keep task files free of unnecessary secrets. Prefer describing required credentials or environment assumptions instead of pasting tokens, private keys, or personal data.
+### Step 3: Spawn the operator sub-agent
 
-See `references/task-file-template.md` for a reusable structure.
+```javascript
+sessions_spawn({
+  runtime: "subagent",
+  mode: "run",
+  task: `You are the OPERATOR for a Claude Code longrun task.
 
-### 3. Launch Claude Code inside tmux
+CRITICAL: 
+- Do NOT create tmux sessions. One already exists.
+- Do NOT spawn more sub-agents.
+- Do NOT analyze the code yourself — you must use Claude Code.
 
-Preferred pattern:
+Tmux session name: ${SESSION_NAME}
+Project directory: /root/workspace/my_note
+
+1. Send this command to launch Claude Code:
+   tmux send-keys -t ${SESSION_NAME} "cd /root/workspace/my_note && claude --permission-mode bypassPermissions" Enter
+   sleep 4
+
+2. Send the task:
+   tmux send-keys -t ${SESSION_NAME} -l -- "$(cat /root/.openclaw/workspace/scripts/task-[shortname].md)"
+   tmux send-keys -t ${SESSION_NAME} Enter
+
+3. Wait 60 seconds, then check:
+   tmux capture-pane -t ${SESSION_NAME} -p | tail -60
+
+4. If Claude is still working, wait another 60s and check again. Do this up to 3 times.
+
+5. When Claude signals done (look for completion markers or "Human:" prompt), collect final output:
+   tmux capture-pane -t ${SESSION_NAME} -p | tail -150
+
+6. Kill the session:
+   tmux kill-session -t ${SESSION_NAME}
+
+7. Report:
+   - 任务状态: ✅ 完成 / ⚠️ 阻塞 / 🚨 失败
+   - UI 风格总结
+   - 主要问题
+   - 优化建议`
+});
+```
+
+### Step 4: Yield
+
+```javascript
+sessions_yield({ message: "Claude Code 已在 tmux 中启动，完成后会自动通知你。" });
+```
+
+---
+
+# Phase 2: Operator Sub-Agent Workflow (READ ONLY — don't respawn)
+
+You are the **operator**. Your job is to send commands to the EXISTING tmux session and monitor Claude Code.
+
+**You did NOT create this session. It was created by the parent agent.**
+
+Commands you MUST run (in order):
 
 ```bash
-cd /path/to/project && claude --permission-mode bypassPermissions
+# 1. Launch Claude Code in the existing session
+tmux send-keys -t ${SESSION_NAME} "cd /root/workspace/my_note && claude --permission-mode bypassPermissions" Enter
+sleep 4
+
+# 2. Send the task (the text of the task file)
+tmux send-keys -t ${SESSION_NAME} -l -- "$(cat /root/.openclaw/workspace/scripts/task-[shortname].md)"
+tmux send-keys -t ${SESSION_NAME} Enter
+
+# 3. Wait and monitor (check every 60s, up to 3 times)
+sleep 60
+tmux capture-pane -t ${SESSION_NAME} -p | tail -60
+
+# 4. If still running, wait more
+sleep 60
+tmux capture-pane -t ${SESSION_NAME} -p | tail -60
+
+# 5. If still running, wait more  
+sleep 60
+tmux capture-pane -t ${SESSION_NAME} -p | tail -60
+
+# 6. Collect final output
+tmux capture-pane -t ${SESSION_NAME} -p | tail -150
+
+# 7. Cleanup
+tmux kill-session -t ${SESSION_NAME}
 ```
 
-Then send Claude a short instruction telling it to read the task file and execute from there.
+---
 
-Example instruction sent into tmux:
+# tmux Cheat Sheet
 
-```text
-Read ./.openclaw-tasks/claude-task.md, follow it exactly, keep notes concise, and tell me when you are blocked or fully done.
-```
+| Command | Purpose |
+|---------|---------|
+| `tmux new-session -d -s <name>` | Create detached session |
+| `tmux send-keys -t <name> -l -- "text"` | Send text to session |
+| `tmux send-keys -t <name> Enter` | Press Enter |
+| `tmux capture-pane -t <name> -p` | Read session output |
+| `tmux capture-pane -t <name> -p \| tail -40` | Last 40 lines |
+| `tmux kill-session -t <name>` | Stop session |
+| `tmux list-sessions` | Show all sessions |
 
-## Monitoring strategy
+---
 
-### Default
+# Why tmux?
 
-Check output with `tmux capture-pane` at **low frequency**.
+`claude --print` loses context between calls. tmux keeps Claude Code alive so:
+- Context persists across "continue" requests
+- Claude can run long investigations without timeout
+- You can send follow-up commands into the same session
 
-Good default cadence:
+---
 
-- first check after a short settling period
-- then about every **5 minutes** for long tasks
-- faster only when the agent is clearly waiting for input
+# Common Pitfalls
 
-### Do
+1. **Creating tmux session in sub-agent** — parent creates it, sub-agent uses it
+2. **Polling too often** — If Claude is working, let it work. Check every 60s.
+3. **Huge inline prompts** — Always use a task file instead.
+4. **Forgetting bypassPermissions** — Use `--permission-mode bypassPermissions` for exec/write operations.
 
-- capture recent output
-- look for explicit questions, blockers, test failures, or completion
-- let Claude continue if it is clearly making progress
-
-### Do not
-
-- interrupt just because output paused briefly
-- resend the task repeatedly
-- kill and restart a healthy run too early
-
-## Interaction pattern
-
-Use tmux as the persistent shell, not as a chat transcript viewer.
-
-Typical loop:
-
-1. create tmux session
-2. launch Claude Code in project dir
-3. write task file
-4. send a short “read this task file” instruction
-5. capture output occasionally
-6. only intervene if Claude asks for input, stalls clearly, or finishes
-
-## Recommended command patterns
-
-### Start session
-
-```bash
-tmux new-session -d -s <session-name>
-```
-
-### Start Claude inside that session
-
-```bash
-tmux send-keys -t <session-name> 'cd /path/to/project && claude --permission-mode bypassPermissions' Enter
-```
-
-### Send the task instruction safely
-
-```bash
-tmux send-keys -t <session-name> -l -- 'Read ./.openclaw-tasks/claude-task.md and execute it. If blocked, say exactly what you need.'
-sleep 0.1
-tmux send-keys -t <session-name> Enter
-```
-
-### Check recent output
-
-```bash
-tmux capture-pane -t <session-name> -p | tail -40
-```
-
-### Check entire scrollback when needed
-
-```bash
-tmux capture-pane -t <session-name> -p -S -
-```
-
-## Decision guide
-
-### Use one-shot `claude --print` when
-
-- the ask is narrow
-- no persistent context is needed
-- a single response is likely enough
-
-### Use this skill when
-
-- the ask is open-ended or investigative
-- the user is likely to iterate on Claude's work
-- you expect code, test, revise, and re-run cycles
-- preserving Claude's local context is part of the value
-
-## Output expectations
-
-When using this skill, keep the human updated only when something meaningful changes:
-
-- started and where it is running
-- blocked and what input is needed
-- milestone reached
-- finished with concrete results
-
-Do not spam the user with minor polling updates.
-
-## Common pitfalls
-
-- Starting Claude with a huge inline prompt instead of a task file
-- Polling too often and mistaking quiet work for failure
-- Forgetting to run from the correct project directory
-- Using this pattern for tiny tasks that should have been one-shot
-- Embedding local machine assumptions or private workflow details that make the skill less portable
-
-## References
+# References
 
 - Task file template: `references/task-file-template.md`
 - Operation examples: `references/operation-examples.md`
